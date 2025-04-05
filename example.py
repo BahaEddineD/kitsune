@@ -5,19 +5,8 @@ import logging
 from scapy.all import IP  # For packet parsing (requires adjustment in Kitsune)
 
 # Configure logging for general traffic and anomaly detection
-logging.basicConfig(level=logging.INFO)
-traffic_logger = logging.getLogger('traffic')
-anomaly_logger = logging.getLogger('anomaly')
-
-# File handlers for logs (paths are Docker-compatible)
-traffic_handler = logging.FileHandler('/app/logs/traffic.log')
-anomaly_handler = logging.FileHandler('/app/logs/anomaly.log')
-
-# Set log formats as JSON
 class JsonFormatter(logging.Formatter):
     def format(self, record):
-        import json
-        from datetime import datetime
         record_dict = {
             'time': datetime.fromtimestamp(record.created).strftime('%Y-%m-%d %H:%M:%S.%f%z'),
             'level': record.levelname,
@@ -25,86 +14,104 @@ class JsonFormatter(logging.Formatter):
         }
         return json.dumps(record_dict)
 
-formatter = JsonFormatter()
-traffic_handler.setFormatter(formatter)
-anomaly_handler.setFormatter(formatter)
+class KitsuneMonitor:
+    def __init__(self):
+        self.setup_logging()
+        self.running = True
+        signal.signal(signal.SIGTERM, self.handle_shutdown)
+        signal.signal(signal.SIGINT, self.handle_shutdown)
 
-# Add handlers to loggers
-traffic_logger.addHandler(traffic_handler)
-anomaly_logger.addHandler(anomaly_handler)
+        # Kitsune parameters
+        self.packet_limit = np.Inf
+        self.maxAE = 10
+        self.FMgrace = 5000
+        self.ADgrace = 50000
+        self.learning_rate = 0.01
+        self.hidden_ratio = 0.75
+        self.anomaly_threshold = 0.1
 
-# KitNET parameters
-maxAE = 10  # Maximum size for any autoencoder in the ensemble layer
-FMgrace = 5000  # Feature mapping grace period (training ensemble architecture)
-ADgrace = 50000  # Anomaly detector grace period (training the ensemble)
+        # File monitoring
+        self.pcap_dir = "/data"
+        self.current_file = os.path.join(self.pcap_dir, "current.pcap")
+        self.last_processed_size = 0
+        self.kitsune = None
 
-# Path to the PCAP file (mounted in Docker)
-path = "/data/wifi.pcap"
-packet_limit = np.Inf  # Process all packets in the file
+    def setup_logging(self):
+        self.logger = logging.getLogger('kitsune')
+        self.logger.setLevel(logging.INFO)
+        log_dir = "/app/logs/kitsune"
+        os.makedirs(log_dir, exist_ok=True)
+        handler = logging.FileHandler(os.path.join(log_dir, 'anomaly.log'))
+        handler.setFormatter(JsonFormatter())
+        self.logger.addHandler(handler)
 
-# Initialize Kitsune with custom learning rate for robustness
-K = Kitsune(path, packet_limit, maxAE, FMgrace, ADgrace, learning_rate=0.01, hidden_ratio=0.75)
+    def handle_shutdown(self, signum, frame):
+        self.logger.info("Received shutdown signal, cleaning up...")
+        self.running = False
 
-import sys
+    def initialize_kitsune(self):
+        self.logger.info(f"Initializing Kitsune with parameters: maxAE={self.maxAE}, FMgrace={self.FMgrace}, ADgrace={self.ADgrace}")
+        self.kitsune = Kitsune(
+            self.current_file,
+            self.packet_limit,
+            self.maxAE,
+            self.FMgrace,
+            self.ADgrace,
+            learning_rate=self.learning_rate,
+            hidden_ratio=self.hidden_ratio
+        )
 
-def debug(msg):
-    print(msg, file=sys.stderr, flush=True)
+    def process_packets(self):
+        packet_count = 0
+        start_time = time.time()
 
-debug(f"Starting Kitsune with PCAP file: {path}")
-debug(f"Parameters: maxAE={maxAE}, FMgrace={FMgrace}, ADgrace={ADgrace}")
-debug("Checking if PCAP file exists...")
-import os
-if os.path.exists(path):
-    debug(f"PCAP file found, size: {os.path.getsize(path)} bytes")
-else:
-    debug(f"ERROR: PCAP file not found at {path}")
-debug("Running Kitsune on wifi.pcap...")
-RMSEs = []
-packet_count = 0
-start_time = time.time()
+        while self.running:
+            if not os.path.exists(self.current_file):
+                time.sleep(1)
+                continue
 
-# Process each packet in real-time
-while True:
-    packet_count += 1
-    if packet_count % 1000 == 0:
-        debug(f"Processed {packet_count} packets")
-    
-    # Process the next packet and get RMSE
-    rmse = K.proc_next_packet()
-    if rmse == -1:  # End of PCAP file
-        break
-    
-    RMSEs.append(rmse)
-    
-    # Log general traffic details
-    traffic_logger.info(f"Packet {packet_count}: RMSE={rmse:.6f}, Timestamp={time.time()}")
-    
-    # Dynamic threshold for anomaly detection (based on running stats)
-    if packet_count > FMgrace + ADgrace:  # After training periods
-        benign_rmse = RMSEs[FMgrace + ADgrace:packet_count]
-        threshold = np.mean(benign_rmse) + 3 * np.std(benign_rmse)  # 3 standard deviations
-        if rmse > threshold:
-            # Hypothetical method to get current packet (requires Kitsune modification)
-            packet = K.get_current_packet()  # Adjust Kitsune to expose this
-            packet_time = packet.time if packet else time.time()
-            src_ip = packet[IP].src if packet and IP in packet else "N/A"
-            dst_ip = packet[IP].dst if packet and IP in packet else "N/A"
-            protocol = packet.proto if packet and IP in packet else "N/A"
-            anomaly_id = f"anomaly_{packet_count}"
-            
-            anomaly_logger.warning(
-                f"Anomaly detected - ID={anomaly_id}, Packet={packet_count}, "
-                f"RMSE={rmse:.6f}, Threshold={threshold:.6f}, "
-                f"Deviation={(rmse - np.mean(benign_rmse)) / np.std(benign_rmse):.2f}σ, "
-                f"Timestamp={packet_time}, SrcIP={src_ip}, DstIP={dst_ip}, Protocol={protocol}"
-            )
+            current_size = os.path.getsize(self.current_file)
+            if current_size == self.last_processed_size:
+                time.sleep(1)
+                continue
+            if self.kitsune is None:
+                self.initialize_kitsune()
 
-# Calculate and display runtime
-end_time = time.time()
-print(f"Complete. Time elapsed: {end_time - start_time:.2f} seconds")
+            try:
+                rmse = self.kitsune.proc_next_packet()
+                if rmse == -1:
+                    self.logger.info("End of file reached, waiting for new data...")
+                    self.kitsune = None
+                    time.sleep(1)
+                    continue
 
-# Summary statistics for AI system analysis
-if RMSEs:
-    print(f"Total packets processed: {packet_count}")
-    print(f"Average RMSE: {np.mean(RMSEs):.6f}")
-    print(f"Max RMSE: {np.max(RMSEs):.6f}")
+                packet_count += 1
+                if packet_count % 1000 == 0:
+                    self.logger.info(f"Processed {packet_count} packets")
+
+                if rmse > self.anomaly_threshold:
+                    self.logger.info(json.dumps({
+                        'packet_id': packet_count,
+                        'rmse': float(rmse),
+                        'anomaly': True,
+                        'timestamp': datetime.now().isoformat()
+                    }))
+
+            except Exception as e:
+                self.logger.error(f"Error processing packet: {str(e)}")
+                time.sleep(1)
+
+            self.last_processed_size = current_size
+
+    def run(self):
+        self.logger.info("Starting Kitsune monitoring service")
+        try:
+            self.process_packets()
+        except Exception as e:
+            self.logger.error(f"Fatal error: {str(e)}")
+        finally:
+            self.logger.info("Kitsune monitoring service stopped")
+
+if __name__ == "__main__":
+    monitor = KitsuneMonitor()
+    monitor.run()
