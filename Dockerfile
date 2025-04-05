@@ -34,5 +34,8 @@ COPY --from=builder /usr/local/lib/python3.8/site-packages /usr/local/lib/python
 # Copy compiled files and source code
 COPY --from=builder /build .
 
+# Create log directory
+RUN mkdir -p /app/logs/kitsune
+
 # Run the application
 CMD ["python", "example.py"]
