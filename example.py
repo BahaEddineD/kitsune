@@ -21,6 +21,9 @@ class KitsuneMonitor:
         signal.signal(signal.SIGTERM, self.handle_shutdown)
         signal.signal(signal.SIGINT, self.handle_shutdown)
 
+        # Path to the PCAP chunks directory (mounted in Docker)
+        self.pcap_dir = "/data/pcap-chunks"
+
         # Kitsune parameters
         self.packet_limit = np.Inf
         self.maxAE = 10
@@ -30,11 +33,46 @@ class KitsuneMonitor:
         self.hidden_ratio = 0.75
         self.anomaly_threshold = 0.1
 
-        # File monitoring
-        self.pcap_dir = "/data"
-        self.current_file = os.path.join(self.pcap_dir, "current.pcap")
+        # Function to get the latest PCAP file
+        def get_latest_pcap():
+            try:
+                pcap_files = glob.glob(f"{self.pcap_dir}/*.pcap")
+                if not pcap_files:
+                    self.logger.debug(f"No PCAP files found in {self.pcap_dir}")
+                    return None
+                latest = max(pcap_files, key=os.path.getctime)
+                self.logger.debug(f"Found latest PCAP file: {latest}")
+                return latest
+            except Exception as e:
+                self.logger.debug(f"Error finding PCAP files: {str(e)}")
+                return None
+
+        # Wait for PCAP files to be available
+        max_retries = 30
+        retry_count = 0
+        path = None
+
+        while retry_count < max_retries:
+            path = get_latest_pcap()
+            if path:
+                break
+            self.logger.debug(f"Waiting for PCAP files... (attempt {retry_count + 1}/{max_retries})")
+            time.sleep(2)
+            retry_count += 1
+
+        if not path:
+            self.logger.debug(f"No PCAP files found after {max_retries} attempts. Exiting.")
+            sys.exit(1)
+
+        # Initialize Kitsune with custom learning rate for robustness
+        try:
+            self.kitsune = Kitsune(path, self.packet_limit, self.maxAE, self.FMgrace, self.ADgrace, learning_rate=self.learning_rate, hidden_ratio=self.hidden_ratio)
+        except Exception as e:
+            self.logger.debug(f"Failed to initialize Kitsune: {str(e)}")
+            sys.exit(1)
+
+        self.current_file = path
         self.last_processed_size = 0
-        self.kitsune = None
 
     def setup_logging(self):
         self.logger = logging.getLogger('kitsune')
@@ -78,25 +116,32 @@ class KitsuneMonitor:
                 self.initialize_kitsune()
 
             try:
-                rmse = self.kitsune.proc_next_packet()
-                if rmse == -1:
-                    self.logger.info("End of file reached, waiting for new data...")
-                    self.kitsune = None
-                    time.sleep(1)
-                    continue
-
-                packet_count += 1
-                if packet_count % 1000 == 0:
-                    self.logger.info(f"Processed {packet_count} packets")
-
-                if rmse > self.anomaly_threshold:
-                    self.logger.info(json.dumps({
-                        'packet_id': packet_count,
-                        'rmse': float(rmse),
-                        'anomaly': True,
-                        'timestamp': datetime.now().isoformat()
-                    }))
-
+                while True:
+                    try:
+                        packet_count += 1
+                        if packet_count % 1000 == 0:
+                            self.logger.debug(f"Processed {packet_count} packets")
+                        
+                        # Process the next packet and get RMSE
+                        rmse = self.kitsune.proc_next_packet()
+                        if rmse == -1:  # End of PCAP file
+                            # Try to get next PCAP file
+                            path = get_latest_pcap()
+                            if path and path != self.kitsune.FE.path:
+                                self.logger.debug(f"Switching to new PCAP file: {path}")
+                                self.kitsune = Kitsune(path, self.packet_limit, self.maxAE, self.FMgrace, self.ADgrace, learning_rate=self.learning_rate, hidden_ratio=self.hidden_ratio)
+                                continue
+                            break
+                        if rmse > self.anomaly_threshold:
+                            self.logger.info(json.dumps({
+                                'packet_id': packet_count,
+                                'rmse': float(rmse),
+                                'anomaly': True,
+                                'timestamp': datetime.now().isoformat()
+                            }))
+                    except Exception as e:
+                        self.logger.error(f"Error processing packet: {str(e)}")
+                        time.sleep(1)
             except Exception as e:
                 self.logger.error(f"Error processing packet: {str(e)}")
                 time.sleep(1)
